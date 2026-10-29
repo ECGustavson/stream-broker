@@ -1,13 +1,13 @@
 {
   "scales": [
     {
-      "name": "Scale680_01",
+      "name": "Scale680",
       "mode": "listen",
-      "ip": "10.10.10.11",
-      "port": 10010,
+      "ip": "192.168.10.12",
+      "port": 10005,
       "enabled": true,
       "description": "680 - Rice Lake stream format",
-      "units": { "P": "LB", "S": "KG" },
+      "units": { "L": "LB", "K": "KG", "P": "LB", "S": "KG" },
       "stream_timeout_seconds": 5
     }
   ],

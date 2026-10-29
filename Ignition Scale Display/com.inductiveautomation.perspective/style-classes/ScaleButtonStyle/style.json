@@ -1,0 +1,25 @@
+{
+  "base": {
+    "style": {
+      "backgroundColor": "#3A3D40",
+      "borderColor": "#E84118",
+      "borderStyle": "solid",
+      "borderWidth": "3px",
+      "borderTopLeftRadius": "10px",
+      "borderTopRightRadius": "10px",
+      "borderBottomLeftRadius": "10px",
+      "borderBottomRightRadius": "10px",
+      "boxShadow": "0px 3px 6px 0px rgba(0,0,0,0.16), 0px 3px 6px 0px rgba(0,0,0,0.23)",
+      "color": "#F5F6FA",
+      "cursor": "pointer",
+      "fontFamily": "Noto Sans",
+      "fontSize": "18px",
+      "letterSpacing": "1px",
+      "marginBottom": "10px",
+      "marginLeft": "15px",
+      "marginRight": "15px",
+      "marginTop": "10px",
+      "opacity": "1"
+    }
+  }
+}

@@ -1,0 +1,479 @@
+{
+  "custom": {},
+  "params": {},
+  "props": {
+    "defaultSize": {
+      "width": 1200
+    }
+  },
+  "root": {
+    "children": [
+      {
+        "children": [
+          {
+            "children": [
+              {
+                "meta": {
+                  "name": "WeightDisplay"
+                },
+                "position": {
+                  "basis": "125px",
+                  "shrink": 0
+                },
+                "propConfig": {
+                  "props.value": {
+                    "binding": {
+                      "config": {
+                        "fallbackDelay": 2.5,
+                        "mode": "direct",
+                        "tagPath": "[edge]Scale680/Weight"
+                      },
+                      "overlayOptOut": true,
+                      "type": "tag"
+                    }
+                  }
+                },
+                "props": {
+                  "diodeOffColor": "#2B2B2B",
+                  "diodeOnColor": "#E84118",
+                  "segmentFormat": "7 segment"
+                },
+                "type": "ia.display.led-display"
+              },
+              {
+                "children": [
+                  {
+                    "children": [
+                      {
+                        "events": {
+                          "dom": {
+                            "onClick": {
+                              "config": {
+                                "script": "\tsystem.tag.writeBlocking([\"[edge]Scale680/Command.value\"], [\"KZERO\"])"
+                              },
+                              "scope": "G",
+                              "type": "script"
+                            }
+                          }
+                        },
+                        "meta": {
+                          "name": "btnZero"
+                        },
+                        "position": {
+                          "basis": "80px",
+                          "shrink": 0
+                        },
+                        "props": {
+                          "style": {
+                            "classes": "ScaleButtonStyle"
+                          },
+                          "text": "ZERO"
+                        },
+                        "type": "ia.input.button"
+                      },
+                      {
+                        "events": {
+                          "dom": {
+                            "onClick": {
+                              "config": {
+                                "script": "\tsystem.tag.writeBlocking([\"[edge]Scale680/Command.value\"], [\"KTARE\"])"
+                              },
+                              "scope": "G",
+                              "type": "script"
+                            }
+                          }
+                        },
+                        "meta": {
+                          "name": "btnTare"
+                        },
+                        "position": {
+                          "basis": "80px",
+                          "shrink": 0
+                        },
+                        "props": {
+                          "style": {
+                            "classes": "ScaleButtonStyle"
+                          },
+                          "text": "TARE"
+                        },
+                        "type": "ia.input.button"
+                      },
+                      {
+                        "events": {
+                          "dom": {
+                            "onClick": {
+                              "config": {
+                                "script": "\tsystem.tag.writeBlocking([\"[edge]Scale680/Command.value\"], [\"KCLRTAR\"])"
+                              },
+                              "scope": "G",
+                              "type": "script"
+                            }
+                          }
+                        },
+                        "meta": {
+                          "name": "btnClear"
+                        },
+                        "position": {
+                          "basis": "80px",
+                          "shrink": 0
+                        },
+                        "props": {
+                          "style": {
+                            "classes": "ScaleButtonStyle"
+                          },
+                          "text": "CLEAR"
+                        },
+                        "type": "ia.input.button"
+                      },
+                      {
+                        "meta": {
+                          "name": "btnPrint"
+                        },
+                        "position": {
+                          "basis": "80px",
+                          "shrink": 0
+                        },
+                        "props": {
+                          "image": {
+                            "icon": {
+                              "color": "#F5F6FA",
+                              "path": "material/print"
+                            }
+                          },
+                          "style": {
+                            "classes": "ScaleButtonStyle"
+                          },
+                          "text": ""
+                        },
+                        "type": "ia.input.button"
+                      }
+                    ],
+                    "meta": {
+                      "name": "ButtonContainer"
+                    },
+                    "position": {
+                      "shrink": 0
+                    },
+                    "props": {
+                      "alignContent": "center"
+                    },
+                    "type": "ia.container.flex"
+                  },
+                  {
+                    "children": [
+                      {
+                        "children": [
+                          {
+                            "meta": {
+                              "name": "ModeLabel"
+                            },
+                            "position": {
+                              "shrink": 0
+                            },
+                            "props": {
+                              "text": "Weigh Mode:"
+                            },
+                            "type": "ia.display.label"
+                          },
+                          {
+                            "meta": {
+                              "name": "ModeIndicator"
+                            },
+                            "position": {
+                              "basis": "64px",
+                              "shrink": 0
+                            },
+                            "propConfig": {
+                              "props.text": {
+                                "binding": {
+                                  "config": {
+                                    "fallbackDelay": 2.5,
+                                    "mode": "direct",
+                                    "tagPath": "[edge]Scale680/Mode"
+                                  },
+                                  "overlayOptOut": true,
+                                  "type": "tag"
+                                }
+                              }
+                            },
+                            "props": {
+                              "textStyle": {
+                                "color": "#2B2B2B",
+                                "fontSize": 18,
+                                "fontWeight": "bold",
+                                "textAlign": "center"
+                              }
+                            },
+                            "type": "ia.display.label"
+                          }
+                        ],
+                        "meta": {
+                          "name": "ModeContainer"
+                        },
+                        "position": {
+                          "shrink": 0
+                        },
+                        "props": {
+                          "alignContent": "center",
+                          "alignItems": "center",
+                          "justify": "space-between"
+                        },
+                        "type": "ia.container.flex"
+                      },
+                      {
+                        "children": [
+                          {
+                            "meta": {
+                              "name": "MotionLabel"
+                            },
+                            "position": {
+                              "shrink": 0
+                            },
+                            "props": {
+                              "text": "Motion:"
+                            },
+                            "type": "ia.display.label"
+                          },
+                          {
+                            "meta": {
+                              "name": "MotionIndicator"
+                            },
+                            "position": {
+                              "basis": "64px",
+                              "shrink": 0
+                            },
+                            "propConfig": {
+                              "props.elements[0].fill.paint": {
+                                "binding": {
+                                  "config": {
+                                    "fallbackDelay": 2.5,
+                                    "mode": "direct",
+                                    "tagPath": "[edge]Scale680/Motion"
+                                  },
+                                  "overlayOptOut": true,
+                                  "transforms": [
+                                    {
+                                      "fallback": null,
+                                      "inputType": "scalar",
+                                      "mappings": [
+                                        {
+                                          "input": false,
+                                          "output": "#D5D5D5"
+                                        },
+                                        {
+                                          "input": true,
+                                          "output": "#D90000"
+                                        }
+                                      ],
+                                      "outputType": "scalar",
+                                      "type": "map"
+                                    }
+                                  ],
+                                  "type": "tag"
+                                }
+                              }
+                            },
+                            "props": {
+                              "elements": [
+                                {
+                                  "cx": 32,
+                                  "cy": 12,
+                                  "fill": {
+                                    "opacity": 1
+                                  },
+                                  "r": 10,
+                                  "stroke": {
+                                    "paint": "#161616",
+                                    "width": 1.5
+                                  },
+                                  "type": "circle"
+                                }
+                              ],
+                              "style": {
+                                "filter": "drop-shadow(1px 1px 1px rgba(0,0,0,0.25))"
+                              },
+                              "viewBox": "0 0 64 24"
+                            },
+                            "type": "ia.shapes.svg"
+                          }
+                        ],
+                        "meta": {
+                          "name": "MotionContainer"
+                        },
+                        "position": {
+                          "shrink": 0
+                        },
+                        "props": {
+                          "alignContent": "center",
+                          "alignItems": "center",
+                          "justify": "space-between"
+                        },
+                        "type": "ia.container.flex"
+                      },
+                      {
+                        "children": [
+                          {
+                            "meta": {
+                              "name": "CozLabel"
+                            },
+                            "position": {
+                              "shrink": 0
+                            },
+                            "props": {
+                              "text": "Center of Zero: "
+                            },
+                            "type": "ia.display.label"
+                          },
+                          {
+                            "meta": {
+                              "name": "CozIndicator"
+                            },
+                            "position": {
+                              "basis": "64px",
+                              "shrink": 0
+                            },
+                            "propConfig": {
+                              "props.elements[0].fill.paint": {
+                                "binding": {
+                                  "config": {
+                                    "fallbackDelay": 2.5,
+                                    "mode": "direct",
+                                    "tagPath": "[edge]Scale680/CenterOfZero"
+                                  },
+                                  "overlayOptOut": true,
+                                  "transforms": [
+                                    {
+                                      "fallback": null,
+                                      "inputType": "scalar",
+                                      "mappings": [
+                                        {
+                                          "input": false,
+                                          "output": "#D5D5D5"
+                                        },
+                                        {
+                                          "input": true,
+                                          "output": "#00D900"
+                                        }
+                                      ],
+                                      "outputType": "scalar",
+                                      "type": "map"
+                                    }
+                                  ],
+                                  "type": "tag"
+                                }
+                              }
+                            },
+                            "props": {
+                              "elements": [
+                                {
+                                  "cx": 32,
+                                  "cy": 12,
+                                  "fill": {
+                                    "opacity": 1
+                                  },
+                                  "r": 10,
+                                  "stroke": {
+                                    "paint": "#161616",
+                                    "width": 1.5
+                                  },
+                                  "type": "circle"
+                                }
+                              ],
+                              "style": {
+                                "filter": "drop-shadow(1px 1px 1px rgba(0,0,0,0.25))"
+                              },
+                              "viewBox": "0 0 64 24"
+                            },
+                            "type": "ia.shapes.svg"
+                          }
+                        ],
+                        "meta": {
+                          "name": "CozContainer"
+                        },
+                        "position": {
+                          "shrink": 0
+                        },
+                        "props": {
+                          "alignContent": "center",
+                          "alignItems": "center",
+                          "justify": "space-between"
+                        },
+                        "type": "ia.container.flex"
+                      }
+                    ],
+                    "meta": {
+                      "name": "StatusContainer"
+                    },
+                    "position": {
+                      "basis": "90px",
+                      "shrink": 0
+                    },
+                    "props": {
+                      "alignContent": "center",
+                      "direction": "column",
+                      "justify": "space-evenly"
+                    },
+                    "type": "ia.container.flex"
+                  }
+                ],
+                "meta": {
+                  "name": "ControlsContainer"
+                },
+                "position": {
+                  "basis": "200px",
+                  "shrink": 0
+                },
+                "props": {
+                  "alignContent": "flex-start",
+                  "alignItems": "center",
+                  "direction": "column",
+                  "style": {
+                    "minWidth": 0,
+                    "overflow": "hidden"
+                  }
+                },
+                "type": "ia.container.flex"
+              }
+            ],
+            "meta": {
+              "name": "ScaleColumn"
+            },
+            "position": {
+              "shrink": 0
+            },
+            "props": {
+              "direction": "column",
+              "style": {
+                "minWidth": 0,
+                "padding": "15px"
+              }
+            },
+            "type": "ia.container.flex"
+          }
+        ],
+        "meta": {
+          "name": "MainContainer"
+        },
+        "position": {
+          "height": 800,
+          "width": 1200
+        },
+        "props": {
+          "alignContent": "center",
+          "alignItems": "flex-start",
+          "direction": "column"
+        },
+        "type": "ia.container.flex"
+      }
+    ],
+    "meta": {
+      "name": "root"
+    },
+    "props": {
+      "style": {
+        "backgroundColor": "#EDEDED"
+      }
+    },
+    "type": "ia.container.coord"
+  }
+}
