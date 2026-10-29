@@ -1,0 +1,39 @@
+{
+  "scales": [
+    {
+      "name": "FinishScale_01",
+      "program": "finish",
+      "ip": "10.10.10.11",
+      "port": 10010,
+      "enabled": true,
+      "description": "Finish scale - EG12984 v3.01 - manual print key"
+    },
+    {
+      "name": "FinishScale_02",
+      "program": "finish",
+      "ip": "127.0.0.1",
+      "port": 10015,
+      "enabled": true,
+      "description": "Finish scale - EG12984 v3.01 - manual print key"
+    },    
+    {
+      "name": "RailScale_01",
+      "program": "rail",
+      "ip": "10.10.10.12",
+      "port": 10011,
+      "enabled": true,
+      "description": "Rail scale testing"
+    }
+  ],
+  "opc": {
+    "endpoint": "opc.tcp://0.0.0.0:4842/broker",
+    "namespace": "http://floweigh/scalebroker",
+    "pki_dir": "pki",
+    "allow_no_security": true
+  },
+  "logging": {
+    "log_dir": "logs",
+    "max_bytes": 5242880,
+    "backup_count": 10
+  }
+}

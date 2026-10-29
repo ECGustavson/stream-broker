@@ -1,0 +1,14 @@
+version: "2.4"
+
+services:
+  broker:
+    build: .
+    restart: always
+    network_mode: host
+    volumes:
+      - broker-config:/data/config
+      - broker-logs:/data/logs
+
+volumes:
+  broker-config:
+  broker-logs:

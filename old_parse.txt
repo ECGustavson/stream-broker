@@ -1,0 +1,78 @@
+        nodes  = {
+            # ── Core weight data ───────────────────────────────────────────────
+            "GrossWeight":            await folder.add_variable(idx, "GrossWeight",            0.0),
+            "TareWeight":             await folder.add_variable(idx, "TareWeight",             0.0),
+            "NetWeight":              await folder.add_variable(idx, "NetWeight",              0.0),
+            # ── Half weights (rail: live peak data; finish: always 0) ──────────
+            "H1Gross":                await folder.add_variable(idx, "H1Gross",                0.0),
+            "H1Net":                  await folder.add_variable(idx, "H1Net",                  0.0),
+            "H2Gross":                await folder.add_variable(idx, "H2Gross",                0.0),
+            "H2Net":                  await folder.add_variable(idx, "H2Net",                  0.0),
+            # ── Identification ─────────────────────────────────────────────────
+            "Serial":                 await folder.add_variable(idx, "Serial",                 ""),
+            "ScaleID":                await folder.add_variable(idx, "ScaleID",                ""),
+            "ScaleName":              await folder.add_variable(idx, "ScaleName",              ""),
+            "KillID":                 await folder.add_variable(idx, "KillID",                 ""),
+            "LotCode":                await folder.add_variable(idx, "LotCode",                ""),
+            "WeightUnits":            await folder.add_variable(idx, "WeightUnits",            ""),
+            # ── Temperature (finish: live; rail: always 0.0 / empty) ──────────
+            "Temperature":            await folder.add_variable(idx, "Temperature",            0.0),
+            "TempUnits":              await folder.add_variable(idx, "TempUnits",              ""),
+            # ── Printer / order (finish: live; rail: always empty) ────────────
+            "PrinterNumber":          await folder.add_variable(idx, "PrinterNumber",          ""),
+            "OrderNumber":            await folder.add_variable(idx, "OrderNumber",            ""),
+            # ── Timestamp & deduplication key ──────────────────────────────────
+            "Timestamp":              await folder.add_variable(idx, "Timestamp",              ""),
+            "TransactionID":          await folder.add_variable(idx, "TransactionID",          ""),
+            # ── Raw record (diagnostics) ───────────────────────────────────────
+            "RawRecord":              await folder.add_variable(idx, "RawRecord",              ""),
+            # ── Health / watchdog ──────────────────────────────────────────────
+            "Connected":              await folder.add_variable(idx, "Connected",              False),
+            "RecordCount":            await folder.add_variable(idx, "RecordCount",            0),
+            "SecondsSinceLastRecord": await folder.add_variable(idx, "SecondsSinceLastRecord", -1),
+            "LastError":              await folder.add_variable(idx, "LastError",              ""),
+        }
+
+    return {
+        "GrossWeight":   _safe_float(fields[F_GROSS]),
+        "TareWeight":    _safe_float(fields[F_TARE]),
+        "NetWeight":     _safe_float(fields[F_NET]),
+        "H1Gross":       _safe_float(fields[F_H1_GROSS]),
+        "H1Net":         _safe_float(fields[F_H1_NET]),
+        "H2Gross":       _safe_float(fields[F_H2_GROSS]),
+        "H2Net":         _safe_float(fields[F_H2_NET]),
+        "Serial":        fields[F_SERIAL].strip(),
+        "ScaleID":       fields[F_SCALE_ID].strip(),     # 4=dynamic, 9=static
+        "ScaleName":     fields[F_SCALE_NAME].strip(),   # always "RAIL"
+        "KillID":        fields[F_KILL_ID].strip(),
+        "LotCode":       fields[F_LOT].strip(),
+        "WeightUnits":   fields[F_UNITS].strip().upper(),
+        "Temperature":   0.0,                            # not used on rail scale
+        "TempUnits":     "",
+        "PrinterNumber": "",                             # not used on rail scale
+        "OrderNumber":   "",                             # not used on rail scale
+        "Timestamp":     fields[F_DATE].strip() + fields[F_TIME].strip(),
+        "TransactionID": fields[F_TRANS_ID].strip(),     # deduplication key
+    }
+
+    return {
+        "GrossWeight":   _safe_float(fields[F_GROSS]),
+        "TareWeight":    _safe_float(fields[F_TARE]),
+        "NetWeight":     _safe_float(fields[F_NET]),
+        "H1Gross":       0.0,                            # not used on finish scale
+        "H1Net":         0.0,
+        "H2Gross":       0.0,
+        "H2Net":         0.0,
+        "Serial":        fields[F_SERIAL].strip(),
+        "ScaleID":       fields[F_SCALE_ID].strip(),     # programmed via indicator front panel 
+        "ScaleName":     fields[F_SCALE_NAME].strip(),   # HEADMEAT / PIT / BENCHTOP / custom
+        "KillID":        fields[F_KILL_ID].strip(),      # always "0"
+        "LotCode":       fields[F_LOT].strip(),
+        "WeightUnits":   fields[F_UNITS].strip().upper(),
+        "Temperature":   _safe_float(fields[F_TEMP]),
+        "TempUnits":     fields[F_TEMP_UNITS].strip(),   # "F" or "C"
+        "PrinterNumber": fields[F_PRINTER].strip(),
+        "OrderNumber":   fields[F_ORDER].strip(),
+        "Timestamp":     fields[F_DATE].strip() + fields[F_TIME].strip(),
+        "TransactionID": fields[F_TRANS_ID].strip(),
+    }

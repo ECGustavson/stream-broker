@@ -1,0 +1,13 @@
+[connection]
+id=ethernet
+type=ethernet
+interface-name=eth0
+
+[ethernet]
+
+[ipv4]
+method=manual
+address1=10.10.10.10/24
+
+[ipv6]
+method=auto
