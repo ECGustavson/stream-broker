@@ -1,28 +1,14 @@
 {
   "scales": [
     {
-      "name": "FinishScale_01",
-      "program": "finish",
+      "name": "Scale680_01",
+      "mode": "listen",
       "ip": "10.10.10.11",
       "port": 10010,
       "enabled": true,
-      "description": "Finish scale - EG12984 v3.01 - manual print key"
-    },
-    {
-      "name": "FinishScale_02",
-      "program": "finish",
-      "ip": "127.0.0.1",
-      "port": 10015,
-      "enabled": true,
-      "description": "Finish scale - EG12984 v3.01 - manual print key"
-    },    
-    {
-      "name": "RailScale_01",
-      "program": "rail",
-      "ip": "10.10.10.12",
-      "port": 10011,
-      "enabled": true,
-      "description": "Rail scale testing"
+      "description": "680 - Rice Lake stream format",
+      "units": { "P": "LB", "S": "KG" },
+      "stream_timeout_seconds": 5
     }
   ],
   "opc": {

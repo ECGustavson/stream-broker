@@ -1,10 +1,8 @@
-# Scale Broker
+# Stream Broker
 
-TCP bridge between Rice Lake 1280 indicators and Ignition SCADA via OPC UA. The 1280 connects outbound as a TCP client; the broker listens, parses the CSV record, writes to OPC UA tags, and waits for Ignition to send an ACK back through a writable tag. 
+TCP bridge between a Rice Lake 680 indicator and Ignition SCADA via OPC UA. The 680 sends weight continuously in the standard Rice Lake stream format. The broker parses each frame and writes live weight, mode and status to OPC UA tags. Ignition sends zero, tare and gross/net commands back through a writable `Command` tag, and the broker forwards them to the indicator on the same socket.
 
-Supports two 1280 user programs — finish scale (manual print key) and rail scale (automatic peak detection). Designed for dual-instance redundancy where both brokers run simultaneously and each 1280 connects to both.
-
-Most 920i's on site are configured as TCP servers. We may want to change this going forward, or can continue using the stock Ignition driver for 920i's, but the hardwired ethernet cards only support one port connection, meaning redundancy can't be used on the 920i's without additional hardware or software. 
+Built from the tcp-broker (1280) template. The 1280 CSV record and its ACK handshake are gone; the stream needs no acknowledgement.
 
 ---
 
@@ -22,7 +20,7 @@ pip install asyncua cryptography
 
 ## Setup
 
-Edit `scales.json` with your scale names, IPs, ports, and program types, then run:
+Edit `scales.json` with your scale names, IPs, ports, and connection mode, then run:
 
 ```bash
 python broker.py
@@ -45,13 +43,14 @@ python broker.py
 {
   "scales": [
     {
-      "name": "FinishScale_01",
-      "program": "finish",
+      "name": "Scale680_01",
+      "mode": "listen",
+      "ip": "10.10.10.11",
       "port": 10010,
-      "ip": "192.168.1.101",
       "enabled": true,
       "description": "Optional label",
-      "ack_timeout_seconds": 5
+      "units": { "P": "LB", "S": "KG" },
+      "stream_timeout_seconds": 5
     }
   ],
   "opc": {
@@ -68,13 +67,15 @@ python broker.py
 }
 ```
 
-**`program`** — `"finish"` or `"rail"`, case-insensitive.
+**`mode`**: who opens the TCP connection. Default `"listen"`.
+- `"listen"`: the 680 is a TCP client and connects to the broker on `port`. `ip` is a whitelist; set it to `null` or omit it to accept any source. Only one connection per scale is accepted at a time.
+- `"connect"`: the 680 is a TCP server and the broker connects to `ip`:`port`, reconnecting every `reconnect_seconds` (default 5) if the link drops.
 
-**`ip`** — set to `null` or omit to accept connections from any IP on that port. Useful if multiple 1280s share one port.
+**`units`**: optional. Maps the stream's unit code (`P`/`S`/`T`) to the label written to `WeightUnits`. Unmapped codes are published as the raw letter.
 
-**`ack_timeout_seconds`** — how long the broker holds the connection open waiting for Ignition to write the ACK. Default 5.
+**`stream_timeout_seconds`**: if no data arrives for this long, the connection is dropped and `StreamActive`/`Connected` go false. Default 5. Must be longer than the indicator's stream interval.
 
-**`allow_no_security`** — set `true` to run without OPC UA certificates. If certs are needed, run `gen_cert.py` first and set this to `false`.
+**`allow_no_security`**: set `true` to run without OPC UA certificates. If certs are needed, run `gen_cert.py` first and set this to `false`.
 
 ---
 
@@ -84,47 +85,42 @@ Each scale gets its own folder named from the `name` field in config. Tags withi
 
 | Tag | Type | Notes |
 |---|---|---|
-| `GrossWeight` | String | |
-| `TareWeight` | String | |
-| `NetWeight` | String | |
-| `H1Gross` | String | Rail only — first half peak gross |
-| `H1Net` | String | Rail only — first half peak net |
-| `H2Gross` | String | Rail only — second half. Empty if skip side pressed or whole sow |
-| `H2Net` | String | Rail only — second half. Empty if skip side pressed or whole sow |
-| `Serial` | String | |
-| `ScaleID` | String | Rail: 4=dynamic, 9=static. Finish: supervisor menu configured|
-| `ScaleName` | String | Rail: always RAIL. Finish: supervisor menu configured |
-| `KillID` | String | Rail: sequential head count, resets midnight. Finish: always ''. |
-| `LotCode` | String | |
-| `WeightUnits` | String | e.g. LB, KG |
-| `Temperature` | String | Finish only |
-| `TempUnits` | String | Finish only |
-| `PrinterNumber` | String | Finish only |
-| `OrderNumber` | String | Finish only |
-| `Timestamp` | String | YYYYMMDDHHMMSS |
-| `TransactionID` | String | 18-char deduplication key |
-| `Message` | String | Full raw CSV — Ignition watches this tag for new records |
-| `Writable` | String | Ignition writes the ACK string here |
-| `HandshakeAgain` | Boolean | Write True to resend the last ACK without re-inserting to DB |
-| `RawRecord` | String | Same as Message — kept for diagnostics |
-| `Connected` | Boolean | |
-| `RecordCount` | Int32 | Resets on broker restart |
-| `SecondsSinceLastRecord` | Int32 | -1 until first record received |
-| `LastError` | String | Last parse failure. Clears on next good record. |
+| `Weight` | Double | Signed weight. Not updated on out-of-range/invalid frames that carry no number |
+| `WeightDisplay` | String | Signed weight as sent, keeps the indicator's decimal places (e.g. `-12.50`) |
+| `WeightUnits` | String | Mapped via `units` in config, else raw `P`/`S`/`T` |
+| `Mode` | String | `GROSS`, `NET`, or `TARE` |
+| `Status` | String | `OK`, `MOTION`, `OUT_OF_RANGE`, `INVALID`, `COZ` |
+| `Motion` | Boolean | Status = motion |
+| `CenterOfZero` | Boolean | Status = center of zero |
+| `Command` | String | **Writable.** Ignition writes a command here; the broker sends it and clears the tag |
+| `CommandResponse` | String | Indicator reply (`OK` / `??`), or `REJECTED: ...` from the broker |
+| `LastCommand` | String | Last command actually sent to the indicator |
+| `Connected` | Boolean | TCP connection up |
+| `StreamActive` | Boolean | Valid frames are arriving |
+| `FrameCount` | Int64 | Valid frames this session. Updated once per second |
+| `SecondsSinceLastFrame` | Int64 | -1 until first frame |
+| `LastError` | String | Last parse failure. Clears on next good frame |
+
+Weight tags are only written when the reading changes, so a stable scale doesn't flood OPC with identical writes. After a disconnect the weight tags keep their last value. Check `StreamActive` before trusting them.
 
 ---
 
-## ACK handshake
+## Commands
 
-After writing the OPC tags, the broker holds the TCP connection open and polls `Writable` every 100ms for up to `ack_timeout_seconds`. Ignition's tag change script fires on `Message`, inserts to the database, then writes the ACK string to `Writable`. Operation to be confirmed through testing. 
+Ignition writes one of these strings to `Command` (case-insensitive):
 
-ACK format: `F#1=OK{TransactionID}{HHmmDDMMyy}` + CRLF
+| Command | Action |
+|---|---|
+| `KZERO` | Zero |
+| `KTARE` | Tare |
+| `KGROSSNET` | Toggle gross/net |
+| `KGROSS` | Gross mode |
+| `KNET` | Net mode |
+| `KCLRTAR` | Clear tare (also returns to gross) |
 
-The `F#1=` prefix triggers the 1280's `Cmd1Handler`. The remaining 30 characters (`OK` + 18-char TransactionID + 10-char timestamp) are what the 1280 validates. If the length check passes, the 1280 also syncs its RTC to the returned timestamp.
+The broker polls `Command` every 100ms, clears it, and sends the command CRLF-terminated. It clears `CommandResponse` first, so the indicator's reply always fires a tag change event, even if it's the same `OK` as last time. Any line from the indicator that isn't a stream frame (no STX) is treated as the reply.
 
-`F#2=OKTEST` can be used on the rail scale to simulate limit switch trips
-
-**HandshakeAgain** — if the 1280 didn't receive the ACK and reconnects to retry, write `True` to `HandshakeAgain`. The broker will resend the cached ACK from the previous transaction without Ignition needing to re-run the DB insert. Currenlty unsure of use case, since scale closes connection after a programmable time in the config menu. This may be from 920i server ports, where Ignition always held the connection open unless manually disabled. 
+The broker rejects anything that isn't in the list above with `REJECTED: unknown command`, so a bad tag write can't push configuration commands to the indicator. It also rejects commands written while the indicator is disconnected (`REJECTED: indicator not connected`) instead of queuing them. Otherwise a stale `KZERO` could run when the scale reconnects.
 
 ---
 
@@ -134,17 +130,16 @@ The `>` prompt appears on startup.
 
 | Command | Description |
 |---|---|
-| `status` | All scales — connected, record count, last record age |
-| `status <name>` | Detail including last TransactionID and last ACK sent |
+| `status` | All scales: connected, stream active, current reading |
+| `status <name>` | Detail including last command and response |
 | `list` | All scales from config |
 | `enable <name>` | Enable in config |
 | `disable <name>` | Disable in config |
 | `rename <old> <new>` | Rename in config |
-| `reload` | Reload config + restart TCP listeners |
-| `loglevel <name> <LEVEL>` | DEBUG / INFO / WARNING / ERROR |
+| `reload` | Reload config + restart TCP listeners/connections |
+| `loglevel <name> <LEVEL>` | DEBUG / INFO / WARNING / ERROR. DEBUG logs every raw frame |
 | `tail <name> [n]` | Last n log lines (default 20) |
-| `ack <name>` | Manually ACK last record on a scale — for testing without Ignition |
-| `ack last` | Same, but targets whichever scale most recently received a record |
+| `send <name> <COMMAND>` | Send a command to the indicator, for testing without Ignition |
 | `certstatus` | Cert expiry, SANs, trusted store contents |
 | `quit` | Shut down |
 
@@ -152,19 +147,22 @@ The `>` prompt appears on startup.
 
 ---
 
-## Message formats
+## Stream format
 
-Both programs use the same 20-field comma-delimited layout, CRLF terminated.
-
-**Finish** (fields 8–11 always empty, fields 13–16 populated):
 ```
-Serial,,ScaleName,0,Lot,Gross,Tare,Net,,,,,Units,Temp,TempUnits,Printer,Order,YYYYMMDD,HHMMSS,TransactionID
+<STX><P><W7.><U><M><S><CR><LF>
 ```
 
-**Rail** (fields 8–11 populated, fields 13–16 always empty — note four consecutive commas):
-```
-Serial,ScaleID,RAIL,KillID,Lot,Gross,Tare,Net,H1Gross,H1Net,H2Gross,H2Net,Units,0.0,,,,YYYYMMDD,HHMMSS,TransactionID
-```
+| Field | Width | Values |
+|---|---|---|
+| STX | 1 | ASCII 0x02 |
+| P | 1 | Polarity: space = +, `-` = - |
+| W7. | 7 | Weight incl. decimal point, leading spaces |
+| U | 1 | Units: `P` primary, `S` secondary, `T` tertiary |
+| M | 1 | Mode: `G` gross, `N` net, `T` tare |
+| S | 1 | Status: space OK, `M` motion, `O` out of range, `I` invalid, `Z` center of zero |
+
+Example: `<STX>  1234.5PG <CR><LF>` is +1234.5, primary units, gross, OK.
 
 ---
 
@@ -172,9 +170,9 @@ Serial,ScaleID,RAIL,KillID,Lot,Gross,Tare,Net,H1Gross,H1Net,H2Gross,H2Net,Units,
 
 `Config → OPC UA → Connections → Add Connection`
 
-Point it at `opc.tcp://<broker-ip>:<port>/broker`. For dual-broker redundancy, add a second connection as the failover endpoint — Ignition will switch automatically if the primary goes unreachable.
+Point it at `opc.tcp://<broker-ip>:<port>/broker`. For dual-broker redundancy, add a second connection as the failover endpoint. Ignition switches automatically if the primary goes unreachable. A 680 with only one socket can only stream to one broker at a time, so redundancy depends on the indicator's ethernet config.
 
-The Ignition UDT watches `Message` for new records and writes ACKs to `Writable`. Finish scales use a tag called `Writable` on the Ignition side; rail scales use `Handshake` — both map to the broker's `Writable` tag.
+Bind the weight/status tags directly. For buttons, write the command string to the `Command` tag and watch `CommandResponse` for `OK` / `??`.
 
 ---
 
@@ -252,12 +250,12 @@ nmcli connection up ethernet
 
 ## Troubleshooting
 
-**Scale not connecting** — check the broker log for a "Rejected connection" line. The source IP doesn't match the `ip` field. Either update the config or set `ip` to `null` to accept any source, functionally disabling the whitelist
+**Scale not connecting (listen mode)**: check the broker log for a "Rejected connection" line. Either the source IP doesn't match the `ip` field, or a connection for that scale is already open. Update the config, or set `ip` to `null` to accept any source.
 
-**Parse errors in LastError** — check `RawRecord` for the raw string. Field count must be exactly 20 to pass parser check. Rail scale messages have four consecutive commas between Units and Date (`LB,0.0,,,,20260421`).
+**Scale not connecting (connect mode)**: the log shows "Connect to ... failed" once, then keeps retrying quietly. Check the indicator's IP/port and that its ethernet port is set up as a server.
 
-**ACK timeout warnings** — Ignition didn't write to `Writable` within the timeout window. Check the Ignition tag change script is enabled and the DB connection is healthy. Use `ack <name>` in the console to test the TCP path independently. Default time values are hardcoded, but can be updated before deployment after testing, or always include time value in scales.json
+**Parse errors in LastError**: set `loglevel <name> DEBUG` to see raw frames. The frame after STX must be exactly 11 characters. If the indicator's stream format was customized, or the weight field is wider or narrower than 7 characters, it won't match.
 
-**OPC tags show Bad quality** — OPC UA connection is down. If running with `allow_no_security: false`, check `certstatus` and verify the cert exchange with Ignition is complete.
+**Connection keeps dropping**: `stream_timeout_seconds` is shorter than the gap between frames, or streaming is turned off on the indicator.
 
-**1280 keeps retrying** — the rail scale retransmits every ~60 seconds until ACKed. Check `status <name>` for the last ACK sent. If needed, use `HandshakeAgain` or `ack <name>` to manually push an ACK.
+**Command returns `??`**: the indicator received the command but rejected it (e.g. tare in motion, or the command isn't valid in the current mode).

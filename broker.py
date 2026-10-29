@@ -1,14 +1,10 @@
 """
-Scale Broker — Rice Lake 1280 TCP -> OPC UA Bridge
----------------------------------------------------
-Supports two Rice Lake 1280 user programs, identified in scales.json
-by the "program" field (case-insensitive):
+Stream Broker — Rice Lake 680 Stream TCP -> OPC UA Bridge
+----------------------------------------------------------
+Parses the standard Rice Lake continuous stream format from a 680 indicator,
+publishes live weight/mode/status to OPC UA tags, and forwards zero/tare/mode
+commands from Ignition back to the indicator on the same socket.
 
-  "finish"  — finish scale, manual print key
-  "rail"    — rail scale, automatic peak detection
-
-Designed for multi-instance in Docker containers, with second instance as fallback.
-User software on all scales will need to be updated to utilize TCPC2 for the fallback instance.
 Config-driven scale naming, per-scale logging, watchdog tags,
 OPC UA Sign & Encrypt (Basic256Sha256), and SSH management console.
 
@@ -22,53 +18,32 @@ Console commands (type 'help' at the > prompt):
     enable  <name>               Enable a scale (save + reload to apply)
     disable <name>               Disable a scale (save + reload to apply)
     rename  <old> <new>          Rename a scale (save + reload to apply)
-    reload                       Reload config and restart TCP listeners
+    reload                       Reload config and restart TCP listeners/connections
     loglevel <name> <LEVEL>      Set log level DEBUG/INFO/WARNING/ERROR
     tail <name> [lines]          Print last n lines of scale log (default 20)
-    ack <name>                   Manually ACK last record on a scale (test without Ignition)
-    ack last                     Manually ACK last record on whichever scale most recently received one
+    send <name> <COMMAND>        Send a command to the indicator (test without Ignition)
     certstatus                   Show certificate and security status
     quit                         Shut down broker
     help                         Show this help
 
-"finish" message format (20 fields, CRLF terminated):
-  0:ScaleNo, 1:ScaleID, 2:ScaleType(PIT, BENCH, etc), 3:KillID(unused), 4:Lot/Sequence(not currently used),
-  5:Gross, 6:Tare, 7:Net, 8:H1Gross(unused), 9:H1Net(unused),
-  10:H2Gross(unused), 11:H2Net(unused), 12:Units, 13:Temp, 14:TempUnits,
-  15:Printer, 16:Order, 17:Date(YYYYMMDD), 18:Time(HHMMSS),
-  19:TransactionID(18 chars: MMDDYY+HHMMSS+000000)
+Stream format (one frame per line):
+  <STX><P><W7.><U><M><S><CR><LF>
+    STX  = ASCII 0x02
+    P    = polarity: space = +, '-' = -
+    W7.  = 7 char weight incl. decimal point, leading spaces
+    U    = units: P=Primary, S=Secondary, T=Tertiary
+    M    = mode: G=Gross, N=Net, T=Tare
+    S    = status: space=OK, M=Motion, O=Out of range, I=Invalid, Z=Center of zero
 
-"rail" message format (20 fields, CRLF terminated) - New String:
-  0:ScaleNo, 1:ScaleID, 2:ScaleType(RAIL), 3:KillID, 4:Lot/Sequence,
-  5:Gross, 6:Tare, 7:Net, 8:H1Gross, 9:H1Net,
-  10:H2Gross, 11:H2Net, 12:Units, 13:Temp(0.0), 14:TempUnits(empty),
-  15:Printer(empty), 16:Order(empty), 17:Date(YYYYMMDD), 18:Time(HHMMSS),
-  19:TransactionID(18 chars: MMDDYY+HHMMSS+Right("000000"+KillID,6))
+Commands (Ignition writes one of these to the Command tag):
+  KZERO, KTARE, KGROSSNET, KGROSS, KNET, KCLRTAR
+  The indicator replies on the same socket (typically "OK" or "??"); any line
+  that is not a stream frame is published to CommandResponse.
 
-ACK handshake:
-  Format: F#1=OK{TransactionID}{HHmmDDMMyy}  (30 chars + CRLF)
-
-  Normal flow:
-    1. 1280 sends record over TCP
-    2. Broker writes Message tag (clears it first to force change event in Ignition)
-    3. Ignition's tag change script on Message fires — does DB insert,
-       builds ACK string, writes it to the Writable tag
-    4. Broker polls Writable, picks up the ACK string, sends to 1280
-
-  Reconnect / retry flow (handled entirely on the Ignition side):
-    1. 1280 didn't receive previous ACK and reconnects, retransmitting the record
-    2. Operator (or Ignition logic) sets HandshakeAgain = True
-    3. Ignition's tag change script on HandshakeAgain fires — same handler
-       as Message change, but should dedupe on TransactionID before re-inserting
-    4. Ignition writes ACK string to Writable
-    5. Broker picks it up and sends to 1280 as normal
-
-  The broker waits indefinitely for Writable to be populated. The only
-  escape is the 1280 closing the TCP socket, which causes readline() to
-  return and the handler to exit cleanly. The 1280 will then reconnect
-  on its retry interval.
-
-  Use 'ack <name>' or 'ack last' in the console to test without Ignition.
+Connection modes (per scale, "mode" in scales.json):
+  "listen"  (default) — indicator is a TCP client and connects to the broker on "port"
+  "connect"           — indicator is a TCP server; broker connects to "ip":"port"
+                        and reconnects automatically
 """
 
 import asyncio
@@ -78,7 +53,6 @@ import logging
 import time
 import os
 import sys
-from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from asyncua import Server, ua
@@ -88,10 +62,15 @@ from asyncua import Server, ua
 
 CONFIG_PATH = "scales.json"
 
-_runtime: dict     = {}   # { name: { connected, record_count, last_record_time, last_error,
-                            #           last_trans_id, last_ack, config } }
+DEFAULT_STREAM_TIMEOUT = 5    # seconds without any data before the connection is dropped
+DEFAULT_RECONNECT      = 5    # seconds between connect attempts in "connect" mode
+
+_runtime: dict     = {}   # { name: { connected, stream_active, frame_count, last_frame_time,
+                            #           last_error, last_data, last_command, last_response,
+                            #           writer, config } }
 _opc_nodes: dict   = {}   # { name: { tag_name: Node } }
 _tcp_servers: list = []
+_connect_tasks: list = []
 _opc_server: Server | None = None
 _make_logger   = None
 _broker_log: logging.Logger | None = None
@@ -163,166 +142,95 @@ def setup_logging(log_cfg: dict):
     return make_logger
 
 
-# Record Parsing
+# Stream parsing
 #
-# Both "finish" and "rail" programs share the same 20-field CSV layout.
-# Field positions are identical between programs; the difference is which
-# fields carry live data vs. empty strings:
+# Frame after STX is a fixed 11 characters:
+#   [0]    polarity
+#   [1:8]  weight (7 chars, right justified, may include decimal point)
+#   [8]    units
+#   [9]    mode
+#   [10]   status
 #
-#   finish: H1/H2 always empty; Temp/TempUnits/Printer/Order populated
-#   rail:   H1/H2 populated with peak weights; Temp/Printer/Order empty
-#           KillID is sequential (resets midnight); ScaleType always "RAIL"
-#           ScaleID = g_iScale (default 4, dynamic) or 9 (static scale)
-#
-# The "program" field in scales.json selects which parser is used.
-# Accepted values (case-insensitive): "finish", "rail"
+# Do NOT strip() the raw line before parsing — polarity and status are
+# both a space in the normal case.
+
+STX        = "\x02"
+FRAME_LEN  = 11
+
+MODES = {
+    "G": "GROSS",
+    "N": "NET",
+    "T": "TARE",
+}
+
+STATUSES = {
+    " ": "OK",
+    "M": "MOTION",
+    "O": "OUT_OF_RANGE",
+    "I": "INVALID",
+    "Z": "COZ",
+}
+
+# Commands Ignition (or the console) is allowed to send to the indicator.
+# Anything else is rejected so a bad tag write can't push arbitrary
+# configuration commands to the indicator.
+INDICATOR_COMMANDS = {"KZERO", "KTARE", "KGROSSNET", "KGROSS", "KNET", "KCLRTAR"}
 
 
-# Field index constants — identical layout for both programs
-F_SCALENO    = 0
-F_SCALE_ID   = 1
-F_SCALE_NAME = 2
-F_KILL_ID    = 3
-F_SEQUENCE   = 4
-F_GROSS      = 5
-F_TARE       = 6
-F_NET        = 7
-F_H1_GROSS   = 8
-F_H1_NET     = 9
-F_H2_GROSS   = 10
-F_H2_NET     = 11
-F_UNITS      = 12
-F_TEMP       = 13
-F_TEMP_UNITS = 14
-F_PRINTER    = 15
-F_ORDER      = 16
-F_DATE       = 17   # YYYYMMDD
-F_TIME       = 18   # HHMMSS
-F_TRANS_ID   = 19   # 18 chars
-
-EXPECTED_FIELDS = 20
-
-
-def parse_record_finish(fields: list[str]) -> dict:
+def parse_stream(raw: str, unit_labels: dict) -> dict:
     """
-    "finish" program — Finish Scale.
-    Triggered by print key press when net weight > threshold.
-    H1/H2 fields are always empty (single-load scale).
-    Temperature comes from Scale 2 automatically or manual entry.
-    Printer and Order are entered by operator or barcode scan.
-    """
-    return {
-        "GrossWeight":   fields[F_GROSS].strip(),
-        "TareWeight":    fields[F_TARE].strip(),
-        "NetWeight":     fields[F_NET].strip(),
-        "H1Gross":       "",
-        "H1Net":         "",
-        "H2Gross":       "",
-        "H2Net":         "",
-        "ScaleNo":       fields[F_SCALENO].strip(),
-        "ScaleID":       fields[F_SCALE_ID].strip(),
-        "ScaleType":     fields[F_SCALE_NAME].strip(),   # HEADMEAT / PIT / BENCHTOP / custom
-        "KillID":        fields[F_KILL_ID].strip(),      # always "0"
-        "Sequence":      fields[F_SEQUENCE].strip(),
-        "WeightUnits":   fields[F_UNITS].strip().upper(),
-        "Temperature":   fields[F_TEMP].strip(),
-        "TempUnits":     fields[F_TEMP_UNITS].strip(),   # "F" or "C"
-        "PrinterNumber": fields[F_PRINTER].strip(),
-        "OrderNumber":   fields[F_ORDER].strip(),
-        "Timestamp":     fields[F_DATE].strip() + fields[F_TIME].strip(),
-        "TransactionID": fields[F_TRANS_ID].strip(),
-    }
-
-
-def parse_record_rail(fields: list[str]) -> dict:
-    """
-    "rail" program — Rail Scale (New String format).
-    Triggered by limit switch / peak detection or static scale print key.
-    H1/H2 fields carry actual peak weights for each half of the animal.
-    H2 fields are empty when Skip Side was pressed (single-half or whole-sow mode).
-    KillID increments per weighment; resets to 0 at midnight.
-    ScaleID = 4 (dynamic hot scale) or 9 (static scale) — set in Supervisor menu.
-    Temperature, Printer, and Order are always empty.
-    """
-    return {
-        "GrossWeight":   fields[F_GROSS].strip(),
-        "TareWeight":    fields[F_TARE].strip(),
-        "NetWeight":     fields[F_NET].strip(),
-        "H1Gross":       fields[F_H1_GROSS].strip(),
-        "H1Net":         fields[F_H1_NET].strip(),
-        "H2Gross":       fields[F_H2_GROSS].strip(),
-        "H2Net":         fields[F_H2_NET].strip(),
-        "ScaleNo":       fields[F_SCALENO].strip(),
-        "ScaleID":       fields[F_SCALE_ID].strip(),     # 4=dynamic, 9=static
-        "ScaleType":     fields[F_SCALE_NAME].strip(),   # always "RAIL"
-        "KillID":        fields[F_KILL_ID].strip(),
-        "Sequence":      fields[F_SEQUENCE].strip(),
-        "WeightUnits":   fields[F_UNITS].strip().upper(),
-        "Temperature":   "",
-        "TempUnits":     "",
-        "PrinterNumber": "",
-        "OrderNumber":   "",
-        "Timestamp":     fields[F_DATE].strip() + fields[F_TIME].strip(),
-        "TransactionID": fields[F_TRANS_ID].strip(),     # deduplication key
-    }
-
-
-def parse_record(raw: str, program: str) -> dict:
-    """
-    Parse a raw CSV line from the 1280, dispatching to the correct
-    program parser based on the scale's 'program' field in scales.json.
+    Parse one Rice Lake stream frame.
 
     Args:
-        raw:     Raw ASCII line from the 1280 (may include CRLF)
-        program: "finish" or "rail" (case-insensitive)
+        raw:         Raw ASCII line from the indicator (may include CRLF)
+        unit_labels: Optional map of unit code -> label from scales.json,
+                     e.g. {"P": "LB"}. Unmapped codes are published as-is.
 
     Returns:
-        Dict of field name -> typed value. All keys match OPC UA tag names.
+        Dict of OPC UA tag name -> value. "Weight" is omitted if the weight
+        field isn't numeric (out of range / invalid frames).
 
     Raises:
-        ValueError: wrong field count, unknown program
+        ValueError: wrong frame length, unknown mode/status, bad weight
     """
-    fields = raw.strip().split(",")
+    # Use the last STX in case of leading garbage after a partial read
+    frame = raw[raw.rindex(STX) + 1:].rstrip("\r\n")
 
-    if len(fields) != EXPECTED_FIELDS:
-        raise ValueError(
-            f"Expected {EXPECTED_FIELDS} fields, got {len(fields)}. "
-            f"Raw: {raw.strip()!r}"
-        )
+    if len(frame) != FRAME_LEN:
+        raise ValueError(f"Expected {FRAME_LEN} chars after STX, got {len(frame)}")
 
-    prog = program.lower().strip()
-    if prog == "finish":
-        return parse_record_finish(fields)
-    elif prog == "rail":
-        return parse_record_rail(fields)
-    else:
-        raise ValueError(
-            f"Unknown program '{program}'. Must be 'finish' or 'rail' (case-insensitive)."
-        )
+    polarity = frame[0]
+    weight   = frame[1:8].strip()
+    unit     = frame[8]
+    mode     = frame[9]
+    status   = frame[10]
 
+    if polarity not in (" ", "-"):
+        raise ValueError(f"Unknown polarity {polarity!r}")
+    if mode not in MODES:
+        raise ValueError(f"Unknown mode {mode!r}")
+    if status not in STATUSES:
+        raise ValueError(f"Unknown status {status!r}")
 
-# ACK string builder - only used for testing using the ack console command
+    sign    = "-" if polarity == "-" else ""
+    display = sign + weight
+    data = {
+        "WeightDisplay": display,
+        "WeightUnits":   unit_labels.get(unit, unit),
+        "Mode":          MODES[mode],
+        "Status":        STATUSES[status],
+        "Motion":        status == "M",
+        "CenterOfZero":  status == "Z",
+    }
 
-def build_ack(trans_id: str) -> str:
-    """
-    Build the ACK string for the 1280 Cmd1Handler.
+    try:
+        data["Weight"] = float(display)
+    except ValueError:
+        # Out of range / invalid frames may not carry a usable number
+        if status not in ("O", "I"):
+            raise ValueError(f"Non-numeric weight {weight!r}")
 
-    The 1280 routes on the "F#1=" prefix, which is stripped before Cmd1Handler
-    receives it. sRxData (what Cmd1Handler validates) = "OK" + TransID + timestamp.
-    Cmd1Handler checks: Left(sRxData,2)="OK" and Len(sRxData)=30.
-
-    sRxData breakdown:
-      "OK"           = 2 chars
-      TransactionID  = 18 chars
-      HHmmDDMMyy     = 10 chars
-      Total          = 30 chars
-
-    Full string sent to 1280: "F#1=" + sRxData + CRLF
-    """
-    now = datetime.now()
-    update_time = now.strftime("%H%M%d%m%y")   # HHmmDDMMyy — 10 chars
-    s_rx_data = f"OK{trans_id}{update_time}"    # 30 chars — what Cmd1Handler validates
-    return f"F#1={s_rx_data}"                  # full string sent over TCP
+    return data
 
 
 # OPC UA SETUP
@@ -379,36 +287,24 @@ async def setup_opc_server(cfg: dict, scales: list) -> Server:
     # Tag definitions: (name, default_value)
     # Single source of truth — easier to maintain than the inline dict.
     TAG_DEFS = [
-        ("GrossWeight",            ""),
-        ("TareWeight",             ""),
-        ("NetWeight",              ""),
-        ("H1Gross",                ""),
-        ("H1Net",                  ""),
-        ("H2Gross",                ""),
-        ("H2Net",                  ""),
-        ("ScaleNo",                ""),
-        ("ScaleID",                ""),
-        ("ScaleType",              ""),
-        ("KillID",                 ""),
-        ("Sequence",               ""),
-        ("WeightUnits",            ""),
-        ("Temperature",            ""),
-        ("TempUnits",              ""),
-        ("PrinterNumber",          ""),
-        ("OrderNumber",            ""),
-        ("Timestamp",              ""),
-        ("TransactionID",          ""),
-        ("Message",                ""),
-        ("Writable",               ""),
-        ("HandshakeAgain",         False),
-        ("RawRecord",              ""),
-        ("Connected",              False),
-        ("RecordCount",            0),
-        ("SecondsSinceLastRecord", -1),
-        ("LastError",              ""),
+        ("Weight",                0.0),
+        ("WeightDisplay",         ""),
+        ("WeightUnits",           ""),
+        ("Mode",                  ""),
+        ("Status",                ""),
+        ("Motion",                False),
+        ("CenterOfZero",          False),
+        ("Command",               ""),
+        ("CommandResponse",       ""),
+        ("LastCommand",           ""),
+        ("Connected",             False),
+        ("StreamActive",          False),
+        ("FrameCount",            0),
+        ("SecondsSinceLastFrame", -1),
+        ("LastError",             ""),
     ]
 
-    CLIENT_WRITABLE = {"Writable", "HandshakeAgain"}
+    CLIENT_WRITABLE = {"Command"}
 
     for scale in scales:
         name = scale["name"]
@@ -450,41 +346,192 @@ async def _build_validator(trusted_dir: Path, rejected_dir: Path):
     )
 
 
+def _new_runtime(scale: dict) -> dict:
+    return {
+        "connected":       False,
+        "stream_active":   False,
+        "frame_count":     0,
+        "last_frame_time": None,
+        "last_error":      "",
+        "last_data":       None,
+        "last_command":    "",
+        "last_response":   "",
+        "writer":          None,
+        "config":          scale,
+    }
+
+
 # Watchdog task - timer can be modified after testing
 
 async def watchdog_task():
-    """Writes SecondsSinceLastRecord for every active scale every 5 s."""
+    """
+    Writes SecondsSinceLastFrame and FrameCount for every active scale every 1 s.
+    FrameCount is written here rather than per frame to keep OPC writes down
+    at stream rate.
+    """
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(1)
         for name, state in list(_runtime.items()):
             if name not in _opc_nodes:
                 continue
-            lrt = state.get("last_record_time")
-            val = -1 if lrt is None else int(time.time() - lrt)
+            lft = state.get("last_frame_time")
+            val = -1 if lft is None else int(time.time() - lft)
             try:
-                await _opc_nodes[name]["SecondsSinceLastRecord"].write_value(val)
+                await _opc_nodes[name]["SecondsSinceLastFrame"].write_value(val)
+                await _opc_nodes[name]["FrameCount"].write_value(state["frame_count"])
             except Exception:
                 pass
 
 
-# Ack sender helper - used by TCP handler and console command
+# Command sender - used by the Command tag poller and the console 'send' command
 
-async def send_ack(writer: asyncio.StreamWriter, ack_str: str, name: str, log: logging.Logger):
-    """Send ACK string to 1280, appending CRLF if not already present."""
-    ack_bytes = (ack_str if ack_str.endswith("\r\n") else ack_str + "\r\n").encode("ascii")
-    writer.write(ack_bytes)
+async def send_command(name: str, cmd: str, log: logging.Logger):
+    """
+    Validate and send a command to the indicator, CRLF terminated.
+    CommandResponse is cleared first so an identical reply ("OK" twice in a
+    row) still fires a tag change event in Ignition.
+
+    Raises:
+        ValueError:      command not in INDICATOR_COMMANDS
+        ConnectionError: indicator not connected
+    """
+    cmd = cmd.strip().upper()
+    if cmd not in INDICATOR_COMMANDS:
+        raise ValueError(f"unknown command '{cmd}'")
+
+    writer = _runtime[name].get("writer")
+    if writer is None or writer.is_closing():
+        raise ConnectionError("indicator not connected")
+
+    nodes = _opc_nodes[name]
+    await nodes["CommandResponse"].write_value("")
+    writer.write(f"{cmd}\r\n".encode("ascii"))
     await writer.drain()
-    # Cache the ACK for diagnostics and the console 'ack' command
-    _runtime[name]["last_ack"] = ack_str.strip()
-    log.info(f"ACK sent: {ack_str.strip()}")
+
+    _runtime[name]["last_command"] = cmd
+    await nodes["LastCommand"].write_value(cmd)
+    log.info(f"TX: {cmd}")
 
 
-# TCP Handler - one per scale, created by make_tcp_handler with scale-specific config closure
+async def command_poller(name: str):
+    """
+    Poll the Command tag every 100ms. Ignition writes a command string,
+    the broker clears the tag and sends it to the indicator. Commands written
+    while the indicator is offline are rejected immediately rather than
+    queued, so a stale KZERO/KTARE can't fire on the next reconnect.
+    """
+    log  = _make_logger(name)
+    node = _opc_nodes[name]["Command"]
+    while True:
+        await asyncio.sleep(0.1)
+        if name not in _runtime:
+            continue
+        try:
+            cmd = await node.read_value()
+            if not cmd:
+                continue
+            await node.write_value("")
+            await send_command(name, cmd, log)
+        except (ValueError, ConnectionError) as e:
+            log.warning(f"Command rejected: {e}")
+            await _opc_nodes[name]["CommandResponse"].write_value(f"REJECTED: {e}")
+        except Exception as e:
+            log.error(f"Command poller error: {e}")
+
+
+# Stream session - shared by listen and connect modes
+
+async def handle_frame(name: str, raw: str, log: logging.Logger):
+    st    = _runtime[name]
+    nodes = _opc_nodes[name]
+    log.debug(f"RX: {raw!r}")
+
+    try:
+        data = parse_stream(raw, st["config"].get("units", {}))
+    except ValueError as e:
+        err = f"Parse error: {e} | raw: {raw!r}"
+        # Only log on change — a bad stream would otherwise log at frame rate
+        if err != st["last_error"]:
+            log.error(err)
+            st["last_error"] = err
+            await nodes["LastError"].write_value(err)
+        return
+
+    st["frame_count"]    += 1
+    st["last_frame_time"] = time.time()
+
+    if not st["stream_active"]:
+        st["stream_active"] = True
+        await nodes["StreamActive"].write_value(True)
+        log.info("Stream active")
+
+    if st["last_error"]:
+        st["last_error"] = ""
+        await nodes["LastError"].write_value("")
+
+    # Skip OPC writes when nothing changed (most frames on a stable scale)
+    if data == st["last_data"]:
+        return
+    st["last_data"] = data
+
+    for key, val in data.items():
+        await nodes[key].write_value(val)
+
+
+async def run_session(name: str, reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter, log: logging.Logger):
+    st      = _runtime[name]
+    nodes   = _opc_nodes[name]
+    timeout = st["config"].get("stream_timeout_seconds", DEFAULT_STREAM_TIMEOUT)
+
+    st["connected"] = True
+    st["writer"]    = writer
+    await nodes["Connected"].write_value(True)
+    await nodes["LastError"].write_value("")
+
+    try:
+        while True:
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout)
+            except asyncio.TimeoutError:
+                log.warning(f"No data for {timeout}s — dropping connection")
+                break
+            if not line:
+                break
+
+            raw = line.decode("ascii", errors="replace")
+
+            if STX in raw:
+                await handle_frame(name, raw, log)
+            elif raw.strip():
+                # Anything that isn't a stream frame is a command reply ("OK" / "??")
+                resp = raw.strip()
+                st["last_response"] = resp
+                await nodes["CommandResponse"].write_value(resp)
+                log.info(f"Response to {st['last_command'] or '?'}: {resp}")
+
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as e:
+        log.warning(f"Connection error: {e}")
+
+    finally:
+        log.info("Disconnected")
+        st["connected"]     = False
+        st["stream_active"] = False
+        st["writer"]        = None
+        st["last_data"]     = None
+        try:
+            await nodes["Connected"].write_value(False)
+            await nodes["StreamActive"].write_value(False)
+        except Exception:
+            pass
+        writer.close()
+
+
+# Listen mode - indicator connects to the broker
 
 def make_tcp_handler(scale: dict):
     name         = scale["name"]
     expected_ip  = scale.get("ip")
-    program      = scale.get("program", "finish").lower().strip()
     log          = _make_logger(name)
 
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -501,113 +548,77 @@ def make_tcp_handler(scale: dict):
             writer.close()
             return
 
-        log.info(f"Connected from {client_ip}")
-        _runtime[name]["connected"] = True
-        await _opc_nodes[name]["Connected"].write_value(True)
-        await _opc_nodes[name]["LastError"].write_value("")
-
-        try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-
-                raw = line.decode("ascii", errors="replace")
-                log.info(f"RX: {raw.strip()}")
-
-                try:
-                    data = parse_record(raw, program)
-
-                    for key, val in data.items():
-                        if key in _opc_nodes[name]:
-                            await _opc_nodes[name][key].write_value(val)
-
-                    # Write RawRecord, then clear Message and rewrite it.
-                    # The clear+rewrite forces a tag change event in Ignition even
-                    # if this record is byte-identical to the previous one
-                    # (e.g. after Ignition restart with a stale Message value).
-                    await _opc_nodes[name]["RawRecord"].write_value(raw.strip())
-                    await _opc_nodes[name]["Message"].write_value("")
-                    await asyncio.sleep(0.05)
-                    await _opc_nodes[name]["Message"].write_value(raw.strip())
-
-                    # Cache TransactionID for the console 'ack' command and diagnostics
-                    trans_id = data.get("TransactionID", "")
-                    _runtime[name]["last_trans_id"] = trans_id
-
-                    count = _runtime[name]["record_count"] + 1
-                    _runtime[name]["record_count"]     = count
-                    _runtime[name]["last_record_time"] = time.time()
-                    _runtime[name]["last_error"]       = ""
-                    await _opc_nodes[name]["LastError"].write_value("") 
-                    await _opc_nodes[name]["RecordCount"].write_value(count)
-
-                    log.info(
-                        f"Record written | TransID={trans_id} | "
-                        f"Net={data.get('NetWeight','')} {data.get('WeightUnits','')} | "
-                        f"Waiting for ACK..."
-                    )
-
-                    # Poll Writable for ACK string from Ignition.
-                    # No timeout — Ignition's tag change script (on Message OR
-                    # HandshakeAgain) will populate Writable when ready. The
-                    # 1280 closing the socket is the escape hatch: writer
-                    # closes, loop exits, outer readline() returns empty.
-                    ack_str = ""
-                    while not writer.is_closing():
-                        await asyncio.sleep(0.1)
-                        ack_str = await _opc_nodes[name]["Writable"].read_value()
-                        if ack_str:
-                            break
-
-                    if ack_str:
-                        await send_ack(writer, ack_str, name, log)
-                        await _opc_nodes[name]["Writable"].write_value("")
-                    else:
-                        # Only reachable if the writer closed during the poll loop
-                        log.warning(
-                            f"Connection closed before ACK received. "
-                            f"TransID={trans_id} | 1280 will retry on next connection."
-                        )
-
-                except Exception as e:
-                    err = f"Parse error: {e} | raw: {raw.strip()}"
-                    log.error(err)
-                    _runtime[name]["last_error"] = err
-                    await _opc_nodes[name]["LastError"].write_value(err)
-
-        except asyncio.IncompleteReadError:
-            pass
-
-        finally:
-            log.info("Disconnected")
-            _runtime[name]["connected"] = False
-            try:
-                await _opc_nodes[name]["Connected"].write_value(False)
-            except Exception:
-                pass
+        if _runtime[name]["connected"]:
+            log.warning(f"Rejected connection from {client_ip} — already connected")
             writer.close()
+            return
+
+        log.info(f"Connected from {client_ip}")
+        await run_session(name, reader, writer, log)
 
     return handle_client
 
 
-# TCP server management
+# Connect mode - broker connects to the indicator's TCP server port
 
-async def start_tcp_servers(scales: list):
+async def connect_loop(scale: dict):
+    name    = scale["name"]
+    host    = scale["ip"]
+    port    = scale["port"]
+    delay   = scale.get("reconnect_seconds", DEFAULT_RECONNECT)
+    log     = _make_logger(name)
+    failing = False
+
+    if name not in _opc_nodes:
+        log.error(f"OPC nodes not ready for '{name}' — full restart required")
+        return
+
+    while True:
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 10)
+        except (OSError, asyncio.TimeoutError) as e:
+            # Log the first failure only, not every retry
+            if not failing:
+                log.warning(f"Connect to {host}:{port} failed ({e!r}) — retrying every {delay}s")
+                failing = True
+            await asyncio.sleep(delay)
+            continue
+
+        failing = False
+        log.info(f"Connected to {host}:{port}")
+        await run_session(name, reader, writer, log)
+        await asyncio.sleep(delay)
+
+
+# TCP server / connection management
+
+async def start_scale_io(scales: list):
     for srv in _tcp_servers:
         srv.close()
         await srv.wait_closed()
     _tcp_servers.clear()
 
+    for task in _connect_tasks:
+        task.cancel()
+    _connect_tasks.clear()
+
     for scale in scales:
-        handler = make_tcp_handler(scale)
-        srv     = await asyncio.start_server(handler, "0.0.0.0", scale["port"])
-        _tcp_servers.append(srv)
-        _broker_log.info(
-            f"  {scale['name']} [{scale.get('program','?')}] "
-            f"listening :{scale['port']}  (IP: {scale.get('ip', 'any')})"
-        )
-        asyncio.ensure_future(srv.serve_forever())
+        mode = scale.get("mode", "listen").lower().strip()
+        if mode == "connect":
+            if not scale.get("ip"):
+                _broker_log.error(f"  {scale['name']}: mode 'connect' requires 'ip' — skipped")
+                continue
+            _connect_tasks.append(asyncio.ensure_future(connect_loop(scale)))
+            _broker_log.info(f"  {scale['name']} [connect] -> {scale['ip']}:{scale['port']}")
+        else:
+            handler = make_tcp_handler(scale)
+            srv     = await asyncio.start_server(handler, "0.0.0.0", scale["port"])
+            _tcp_servers.append(srv)
+            _broker_log.info(
+                f"  {scale['name']} [listen] "
+                f"listening :{scale['port']}  (IP: {scale.get('ip', 'any')})"
+            )
+            asyncio.ensure_future(srv.serve_forever())
 
 
 async def do_reload():
@@ -631,15 +642,7 @@ async def do_reload():
     for scale in enabled:
         name = scale["name"]
         if name not in _runtime:
-            _runtime[name] = {
-                "connected":        False,
-                "record_count":     0,
-                "last_record_time": None,
-                "last_error":       "",
-                "last_trans_id":    "",
-                "last_ack":         "",
-                "config":           scale,
-            }
+            _runtime[name] = _new_runtime(scale)
             if name not in _opc_nodes:
                 _broker_log.warning(
                     f"  '{name}' is new — OPC UA folder requires full restart to appear."
@@ -647,7 +650,7 @@ async def do_reload():
         else:
             _runtime[name]["config"] = scale
 
-    await start_tcp_servers(enabled)
+    await start_scale_io(enabled)
     _broker_log.info("Reload complete.")
     return True
 
@@ -655,7 +658,7 @@ async def do_reload():
 # Console Commands
 
 HELP_TEXT = """
-Scale Broker Management Console
+Stream Broker Management Console
 ─────────────────────────────────────────────────────────────────
   status                        All scales status summary
   status <name>                 Detail view for one scale
@@ -663,20 +666,18 @@ Scale Broker Management Console
   enable  <name>                Enable scale in config
   disable <name>                Disable scale in config
   rename  <old> <name>          Rename scale in config
-  reload                        Reload config + restart TCP listeners
+  reload                        Reload config + restart TCP listeners/connections
   loglevel <name> <LEVEL>       Set log level (DEBUG/INFO/WARNING/ERROR)
   tail <name> [lines]           Last n log lines for a scale (default 20)
-  ack <name>                    Manually ACK last record on named scale
-  ack last                      Manually ACK last record across all scales
+  send <name> <COMMAND>         Send command to indicator
+                                (KZERO KTARE KGROSSNET KGROSS KNET KCLRTAR)
   certstatus                    Show certificate and security status
   quit                          Shut down broker
   help                          Show this help
 ─────────────────────────────────────────────────────────────────
 Note: enable / disable / rename take effect after 'reload'.
       OPC UA folder renames require a full broker restart.
-      'ack' writes to Writable tag — use for testing without Ignition.
-      Broker waits indefinitely for Ignition to populate Writable;
-      1280 disconnect is the only escape from that wait.
+      'loglevel <name> DEBUG' logs every raw stream frame.
 """
 
 
@@ -688,6 +689,13 @@ def _fmt_age(secs) -> str:
     if secs < 3600:
         return f"{secs // 60}m {secs % 60}s ago"
     return f"{secs // 3600}h {(secs % 3600) // 60}m ago"
+
+
+def _fmt_weight(st: dict) -> str:
+    d = st.get("last_data")
+    if not d:
+        return "-"
+    return f"{d['WeightDisplay']} {d['WeightUnits']} {d['Mode']} {d['Status']}"
 
 
 def cmd_status(args):
@@ -702,33 +710,34 @@ def cmd_status(args):
             return
         st  = _runtime[name]
         cfg = st["config"]
-        lrt = st["last_record_time"]
-        age = int(time.time() - lrt) if lrt else -1
+        lft = st["last_frame_time"]
+        age = int(time.time() - lft) if lft else -1
         print()
         print(f"  Scale:             {name}")
-        print(f"  Program:           {cfg.get('program', 'unknown')}")
+        print(f"  Mode:              {cfg.get('mode', 'listen')}")
         print(f"  Description:       {cfg.get('description', '')}")
         print(f"  Port:              {cfg['port']}")
-        print(f"  Expected IP:       {cfg.get('ip', 'any')}")
+        print(f"  IP:                {cfg.get('ip', 'any')}")
         print(f"  Connected:         {'YES' if st['connected'] else 'NO'}")
-        print(f"  Records (session): {st['record_count']}")
-        print(f"  Last record:       {_fmt_age(age)}")
-        print(f"  Last TransID:      {st.get('last_trans_id') or 'none'}")
-        print(f"  Last ACK sent:     {st.get('last_ack') or 'none'}")
+        print(f"  Stream active:     {'YES' if st['stream_active'] else 'NO'}")
+        print(f"  Frames (session):  {st['frame_count']}")
+        print(f"  Last frame:        {_fmt_age(age)}")
+        print(f"  Current reading:   {_fmt_weight(st)}")
+        print(f"  Last command:      {st.get('last_command') or 'none'}")
+        print(f"  Last response:     {st.get('last_response') or 'none'}")
         print(f"  Last error:        {st['last_error'] or 'none'}")
         print()
     else:
         print()
-        print(f"  {'NAME':<22} {'PROG':<10} {'PORT':<7} {'CONN':<6} {'RECORDS':<9} {'LAST RECORD':<18} LAST ERROR")
-        print(f"  {'─'*22} {'─'*10} {'─'*7} {'─'*6} {'─'*9} {'─'*18} {'─'*30}")
+        print(f"  {'NAME':<22} {'MODE':<8} {'PORT':<7} {'CONN':<6} {'STREAM':<7} {'READING':<28} LAST ERROR")
+        print(f"  {'─'*22} {'─'*8} {'─'*7} {'─'*6} {'─'*7} {'─'*28} {'─'*30}")
         for name, st in _runtime.items():
-            lrt  = st["last_record_time"]
-            age  = int(time.time() - lrt) if lrt else -1
-            conn = "YES" if st["connected"] else "NO"
-            err  = st["last_error"]
-            err  = (err[:28] + "..") if len(err) > 30 else err
-            prog = st["config"].get("program", "?")
-            print(f"  {name:<22} {prog:<10} {st['config']['port']:<7} {conn:<6} {st['record_count']:<9} {_fmt_age(age):<18} {err}")
+            conn   = "YES" if st["connected"] else "NO"
+            stream = "YES" if st["stream_active"] else "NO"
+            err    = st["last_error"]
+            err    = (err[:28] + "..") if len(err) > 30 else err
+            mode   = st["config"].get("mode", "listen")
+            print(f"  {name:<22} {mode:<8} {st['config']['port']:<7} {conn:<6} {stream:<7} {_fmt_weight(st):<28} {err}")
         print()
 
 
@@ -738,12 +747,12 @@ def cmd_list(args):
         print("  No scales in config.")
         return
     print()
-    print(f"  {'NAME':<22} {'PROG':<10} {'PORT':<7} {'IP':<18} {'ENABLED':<8} DESCRIPTION")
-    print(f"  {'─'*22} {'─'*10} {'─'*7} {'─'*18} {'─'*8} {'─'*25}")
+    print(f"  {'NAME':<22} {'MODE':<8} {'PORT':<7} {'IP':<18} {'ENABLED':<8} DESCRIPTION")
+    print(f"  {'─'*22} {'─'*8} {'─'*7} {'─'*18} {'─'*8} {'─'*25}")
     for s in scales:
         enabled = "yes" if s.get("enabled", True) else "NO"
-        prog    = s.get("program", "?")
-        print(f"  {s['name']:<22} {prog:<10} {s['port']:<7} {s.get('ip','any'):<18} {enabled:<8} {s.get('description','')}")
+        mode    = s.get("mode", "listen")
+        print(f"  {s['name']:<22} {mode:<8} {s['port']:<7} {s.get('ip') or 'any':<18} {enabled:<8} {s.get('description','')}")
     print()
 
 
@@ -822,47 +831,26 @@ def cmd_tail(args):
     print()
 
 
-async def cmd_ack(args):
+async def cmd_send(args):
     """
-    Manually build and write an ACK string to Writable, simulating what
-    Ignition's tag change script does. Used for testing without Ignition.
-    Builds: F#1=OK{TransactionID}{HHmmDDMMyy}
+    Send a command straight to the indicator, bypassing the Command tag.
+    The reply shows up in the log and on the CommandResponse tag.
     """
-    if not args:
-        print("  Usage: ack <name> | ack last")
+    if len(args) < 2:
+        print("  Usage: send <name> <COMMAND>")
+        print(f"  Commands: {' '.join(sorted(INDICATOR_COMMANDS))}")
         return
 
-    target = args[0]
-
-    if target.lower() == "last":
-        # Find scale with most recent record
-        best_name = None
-        best_time = None
-        for n, st in _runtime.items():
-            lrt = st.get("last_record_time")
-            if lrt and (best_time is None or lrt > best_time):
-                best_time = lrt
-                best_name = n
-        if not best_name:
-            print("  No records received on any scale yet.")
-            return
-        name = best_name
-    else:
-        name = target
-
-    if name not in _runtime:
+    name = args[0]
+    if name not in _runtime or name not in _opc_nodes:
         print(f"  Unknown scale: '{name}'")
         return
 
-    trans_id = _runtime[name].get("last_trans_id", "")
-    if not trans_id:
-        print(f"  No TransactionID cached for '{name}' — has a record been received?")
-        return
-
-    ack_str = build_ack(trans_id)
-    print(f"  Writing ACK to Writable: {ack_str}")
-    await _opc_nodes[name]["Writable"].write_value(ack_str)
-    print(f"  Done. Broker handler will pick it up within 100ms if connection is active.")
+    try:
+        await send_command(name, args[1], _make_logger(name))
+        print(f"  Sent {args[1].upper()}. Reply will appear in the log / CommandResponse tag.")
+    except (ValueError, ConnectionError) as e:
+        print(f"  Not sent: {e}")
 
 
 def cmd_certstatus(args):
@@ -913,25 +901,32 @@ COMMANDS = {
     "loglevel":   (cmd_loglevel,  False),
     "tail":       (cmd_tail,      False),
     "certstatus": (cmd_certstatus, False),
-    "ack":        (cmd_ack,       True),   # True = async command
+    "send":       (cmd_send,      True),   # True = async command
 }
 
 
 # Console loop
 
 async def console_loop():
+    """Returns when the user quits. Shutdown happens by returning from main(),
+    not loop.stop() — stopping the loop under asyncio.run() raises RuntimeError."""
     loop = asyncio.get_event_loop()
-    print("\nScale Broker running. Type 'help' for commands.\n")
+    print("\nStream Broker running. Type 'help' for commands.\n")
 
     while True:
         try:
             line = await loop.run_in_executor(
                 None, lambda: input("> ").strip()
             )
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
+            # stdin looked like a TTY but has no input (VS Code debugger,
+            # Windows NUL device) — keep the broker running without a console
+            _broker_log.info("Console input closed — continuing in background mode.")
+            while True:
+                await asyncio.sleep(3600)
+        except KeyboardInterrupt:
             print("\nShutting down...")
-            loop.stop()
-            break
+            return
 
         if not line:
             continue
@@ -943,8 +938,7 @@ async def console_loop():
             print(HELP_TEXT)
         elif cmd == "quit":
             print("Shutting down...")
-            loop.stop()
-            break
+            return
         elif cmd == "reload":
             await do_reload()
         elif cmd in COMMANDS:
@@ -962,7 +956,7 @@ async def console_loop():
 async def main():
     global _config, _opc_server, _make_logger, _broker_log
 
-    parser = argparse.ArgumentParser(description="Scale Broker")
+    parser = argparse.ArgumentParser(description="Stream Broker")
     parser.add_argument("--config", default=CONFIG_PATH)
     cli_args = parser.parse_args()
 
@@ -974,35 +968,29 @@ async def main():
     _broker_log  = _make_logger("broker")
 
     _broker_log.info("=" * 60)
-    _broker_log.info("Scale Broker starting")
+    _broker_log.info("Stream Broker starting")
     _broker_log.info(f"Config source: {'env var SCALES_CONFIG' if os.getenv('SCALES_CONFIG') else cli_args.config}")
 
     enabled = [s for s in _config["scales"] if s.get("enabled", True)]
     _broker_log.info(f"Enabled scales: {len(enabled)}")
 
     for scale in enabled:
-        prog = scale.get("program", "UNKNOWN").lower().strip()
-        if prog not in ("finish", "rail"):
+        mode = scale.get("mode", "listen").lower().strip()
+        if mode not in ("listen", "connect"):
             _broker_log.warning(
-                f"  Scale '{scale['name']}' has unknown program '{scale.get('program')}' — "
-                "must be 'finish' or 'rail' (case-insensitive). Records will fail to parse."
+                f"  Scale '{scale['name']}' has unknown mode '{scale.get('mode')}' — "
+                "must be 'listen' or 'connect'. Defaulting to listen."
             )
-        _runtime[scale["name"]] = {
-            "connected":        False,
-            "record_count":     0,
-            "last_record_time": None,
-            "last_error":       "",
-            "last_trans_id":    "",
-            "last_ack":         "",
-            "config":           scale,
-        }
+        _runtime[scale["name"]] = _new_runtime(scale)
 
     _opc_server = await setup_opc_server(_config, enabled)
     _broker_log.info(f"OPC nodes built for: {list(_opc_nodes.keys())}")
     _broker_log.info(f"OPC UA endpoint: opc.tcp://0.0.0.0:4842/broker")
 
-    await start_tcp_servers(enabled)
+    await start_scale_io(enabled)
     asyncio.ensure_future(watchdog_task())
+    for name in _opc_nodes:
+        asyncio.ensure_future(command_poller(name))
 
     async with _opc_server:
         # Prevent the EOFError crash when running as a background service in Balena/Docker
